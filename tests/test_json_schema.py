@@ -1850,21 +1850,117 @@ def test_schema_ref_template_key_error():
         models_json_schema([(Bar, 'validation'), (Baz, 'validation')], ref_template='/schemas/{bad_name}.json#/')
 
 
-def test_external_ref():
-    """https://github.com/pydantic/pydantic/issues/9783"""
+@pytest.mark.parametrize(
+    'ref',
+    [
+        'https://json-schema.org/draft/2020-12/schema',
+        'schema.json#/$defs/Model',
+        '../schemas/model.json#/$defs/Model',
+        '/schemas/model.json',
+        'urn:example:model',
+        'file:///schemas/model.json',
+    ],
+)
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+def test_external_ref(ref: str, mode: JsonSchemaMode):
+    """https://github.com/pydantic/pydantic/issues/9783
+    https://github.com/pydantic/pydantic/issues/12093
+    """
 
     class Model(BaseModel):
         json_schema: Annotated[
             dict,
-            WithJsonSchema({'$ref': 'https://json-schema.org/draft/2020-12/schema'}),
+            WithJsonSchema({'$ref': ref}),
         ]
 
-    assert Model.model_json_schema() == {
-        'properties': {'json_schema': {'$ref': 'https://json-schema.org/draft/2020-12/schema', 'title': 'Json Schema'}},
+    assert Model.model_json_schema(mode=mode) == {
+        'properties': {'json_schema': {'$ref': ref, 'title': 'Json Schema'}},
         'required': ['json_schema'],
         'title': 'Model',
         'type': 'object',
     }
+
+
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+def test_external_ref_model_extra(mode: JsonSchemaMode):
+    """https://github.com/pydantic/pydantic/issues/12093"""
+    ref = 'schema.json#/$defs/Model'
+
+    class ModelRef(BaseModel):
+        model_config = ConfigDict(json_schema_extra={'$ref': ref})
+
+    assert ModelRef.model_json_schema(mode=mode) == {
+        '$ref': ref,
+        'properties': {},
+        'title': 'ModelRef',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+def test_external_ref_type_adapter(mode: JsonSchemaMode):
+    """https://github.com/pydantic/pydantic/issues/12093"""
+    ref = 'schema.json#/$defs/Model'
+    adapter = TypeAdapter(Annotated[int, WithJsonSchema({'$ref': ref})])
+    assert adapter.json_schema(mode=mode) == {'$ref': ref}
+
+
+def test_external_ref_with_relative_ref_template():
+    """https://github.com/pydantic/pydantic/issues/12093"""
+    ref = 'external.json#/$defs/Model'
+
+    class Child(BaseModel):
+        value: int
+
+    class Model(BaseModel):
+        internal: Child
+        external: Annotated[int, WithJsonSchema({'$ref': ref})]
+
+    assert Model.model_json_schema(ref_template='schemas/{model}.json') == {
+        '$defs': {
+            'Child': {
+                'properties': {'value': {'title': 'Value', 'type': 'integer'}},
+                'required': ['value'],
+                'title': 'Child',
+                'type': 'object',
+            }
+        },
+        'properties': {
+            'internal': {'$ref': 'schemas/Child.json'},
+            'external': {'$ref': ref, 'title': 'External'},
+        },
+        'required': ['internal', 'external'],
+        'title': 'Model',
+        'type': 'object',
+    }
+
+
+@pytest.mark.parametrize('ref', ['#/$defs/Missing', '#missing', ''])
+def test_external_ref_does_not_hide_unknown_local_refs(ref: str):
+    adapter = TypeAdapter(Annotated[int, WithJsonSchema({'$ref': ref})])
+    with pytest.raises(KeyError, check=lambda exc: exc.args == (ref,)):
+        adapter.json_schema()
+
+
+def test_external_ref_template_preserves_definition_errors():
+    class Model(BaseModel):
+        value: int
+
+    generator = GenerateJsonSchema(ref_template='schemas/{model}.json')
+    schema = generator.generate_inner(Model.__pydantic_core_schema__)
+    ref = schema['$ref']
+    defs_ref = generator.json_to_defs_refs[ref]
+    generator.definitions.clear()
+    with pytest.raises(KeyError, check=lambda exc: exc.args == (defs_ref,)):
+        generator.get_json_ref_counts(schema)
+    with pytest.raises(KeyError, check=lambda exc: exc.args == (defs_ref,)):
+        generator._garbage_collect_definitions(schema)
+
+    generator._core_defs_invalid_for_json_schema[defs_ref] = PydanticInvalidForJsonSchema('Invalid definition')
+    with pytest.raises(PydanticInvalidForJsonSchema, match='Invalid definition'):
+        generator.get_schema_from_definitions(ref)
+    with pytest.raises(PydanticInvalidForJsonSchema, match='Invalid definition'):
+        generator.get_json_ref_counts(schema)
 
 
 def test_schema_no_definitions():
